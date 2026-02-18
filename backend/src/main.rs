@@ -29,3 +29,8 @@
 
 //     Ok(())
 // }
+
+
+fn main(){
+    println(main)
+}
