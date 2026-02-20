@@ -587,6 +587,9 @@ impl InheritanceContract {
         let plan_id = Self::increment_plan_id(&env);
         Self::store_plan(&env, plan_id, &plan);
 
+        // Add to user's plan list
+        Self::add_plan_to_user(&env, owner.clone(), plan_id);
+
         log!(&env, "Inheritance plan created with ID: {}", plan_id);
 
         Ok(plan_id)
