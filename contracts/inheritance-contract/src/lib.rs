@@ -318,6 +318,33 @@ impl InheritanceContract {
         env.storage().persistent().get(&key)
     }
 
+    fn add_plan_to_user(env: &Env, owner: Address, plan_id: u64) {
+        let key = DataKey::UserPlans(owner.clone());
+        let mut plans: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(env));
+
+        plans.push_back(plan_id);
+        env.storage().persistent().set(&key, &plans);
+    }
+
+    fn add_plan_to_deactivated(env: &Env, plan_id: u64) {
+        let key = DataKey::DeactivatedPlans;
+        let mut plans: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(env));
+
+        // Avoid duplicates if called multiple times (though logic should prevent this)
+        if !plans.contains(plan_id) {
+            plans.push_back(plan_id);
+            env.storage().persistent().set(&key, &plans);
+        }
+    }
+
     /// Get plan details
     ///
     /// # Arguments
