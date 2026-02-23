@@ -346,3 +346,78 @@ async fn test_claim_after_concurrent_claims_fails() {
         "Second claim should fail because plan is already claimed"
     );
 }
+
+#[tokio::test]
+async fn test_concurrent_claim_creates_single_audit_log() {
+    // Test: Verify only one audit log is created for concurrent claims
+    // This ensures no duplicate payout is recorded
+    let Some(test_context) = helpers::TestContext::from_env().await else {
+        println!("SKIPPING TEST: no database connection");
+        return;
+    };
+
+    let pool = test_context.pool.clone();
+    let app = test_context.app;
+
+    let user_id = Uuid::new_v4();
+    let email = format!("test_{}@example.com", user_id);
+    
+    // Insert user
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
+        .bind(user_id)
+        .bind(&email)
+        .bind("hashed_password")
+        .execute(&pool)
+        .await
+        .expect("Failed to insert user");
+
+    // Approve KYC
+    sqlx::query("INSERT INTO kyc_status (user_id, status) VALUES ($1, 'approved')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("Failed to approve KYC");
+
+    // Create a due plan
+    let plan_id = insert_due_plan(&pool, user_id).await;
+
+    // Submit two concurrent claim requests with different emails
+    let claim_req_with_email = |email: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/plans/{}/claim", plan_id))
+            .header("Content-Type", "application/json")
+            .header("X-User-Id", user_id.to_string())
+            .body(Body::from(
+                serde_json::to_string(&json!({ "beneficiary_email": email })).unwrap(),
+            ))
+            .unwrap()
+    };
+
+    // Send both claims in parallel
+    let (resp1, resp2) = join!(
+        app.clone().oneshot(claim_req_with_email("beneficiary1@test.com")),
+        app.clone().oneshot(claim_req_with_email("beneficiary2@test.com"))
+    );
+
+    let status1 = resp1.expect("claim1 request failed").status();
+    let status2 = resp2.expect("claim2 request failed").status();
+
+    // Exactly one should succeed
+    let success_count = (status1 == StatusCode::OK) as i32 + (status2 == StatusCode::OK) as i32;
+    assert_eq!(success_count, 1, "Exactly one claim should succeed");
+
+    // Check only one audit log for 'claim' action exists
+    // This verifies no duplicate payout was recorded
+    let audit_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM action_logs WHERE entity_type = 'plan' AND action = 'claim' AND entity_id = $1"
+    )
+        .bind(plan_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_count.0, 1,
+        "Only one audit log should exist for claim action (no duplicate payout)"
+    );
+}
