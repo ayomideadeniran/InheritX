@@ -39,6 +39,7 @@ pub async fn create_app(db: PgPool, config: Config) -> Result<Router, ApiError> 
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/health/db", get(db_health_check))
+        .route("/login", post(crate::auth::login_user))
         .route("/admin/login", post(crate::auth::login_admin))
         .route(
             "/api/auth/nonce/:wallet_address",
@@ -47,6 +48,15 @@ pub async fn create_app(db: PgPool, config: Config) -> Result<Router, ApiError> 
         .route("/api/auth/wallet-login", post(crate::auth::wallet_login))
         .layer(
             ServiceBuilder::new()
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    |State(state): State<Arc<AppState>>,
+                     mut req: axum::http::Request<axum::body::Body>,
+                     next: axum::middleware::Next| async move {
+                        req.extensions_mut().insert(state.config.clone());
+                        next.run(req).await
+                    },
+                ))
                 .layer(TraceLayer::new_for_http())
                 .layer(GovernorLayer {
                     config: governor_conf,
