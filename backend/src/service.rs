@@ -296,9 +296,33 @@ impl PlanService {
         user_id: Uuid,
         req: &ClaimPlanRequest,
     ) -> Result<PlanWithBeneficiary, ApiError> {
-        let plan = Self::get_plan_by_id(db, plan_id, user_id)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("Plan {} not found", plan_id)))?;
+        // Use SELECT FOR UPDATE to lock the plan row and prevent concurrent claims
+        let plan = sqlx::query_as::<_, PlanRowFull>(
+            r#"
+            SELECT id, user_id, title, description, fee, net_amount, status,
+                   contract_plan_id, distribution_method, is_active, contract_created_at,
+                   beneficiary_name, bank_account_number, bank_name, currency_preference,
+                   created_at, updated_at
+            FROM plans
+            WHERE id = $1 AND user_id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(plan_id)
+        .bind(user_id)
+        .fetch_optional(db)
+        .await?
+        .map(|row| plan_row_to_plan_with_beneficiary(&row)?)
+        .ok_or_else(|| ApiError::NotFound(format!("Plan {} not found", plan_id)))?;
+
+        // Check if plan is already claimed - this prevents concurrent claims
+        if plan.status == "claimed" {
+            return Err(ApiError::BadRequest(
+                "This plan has already been claimed".to_string(),
+            ));
+        }
+
+        if !Self::is_due_for_claim(
 
         if !Self::is_due_for_claim(
             plan.distribution_method.as_deref(),
@@ -353,12 +377,24 @@ impl PlanService {
             if let sqlx::Error::Database(ref db_err) = e {
                 if db_err.is_unique_violation() {
                     return ApiError::BadRequest(
-                        "This plan has already been claimed by this beneficiary".to_string(),
+                        "This plan has already been claimed".to_string(),
                     );
                 }
             }
             ApiError::from(e)
         })?;
+
+        // Update plan status to 'claimed' to prevent future concurrent claims
+        sqlx::query(
+            r#"
+            UPDATE plans
+            SET status = 'claimed', updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(plan_id)
+        .execute(db)
+        .await?;
 
         // Audit: plan claimed
         AuditLogService::log(
