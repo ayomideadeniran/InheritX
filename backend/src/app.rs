@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, patch, post},
     Json, Router,
 };
@@ -16,7 +16,9 @@ use crate::auth::{AuthenticatedAdmin, AuthenticatedUser};
 use crate::config::Config;
 use crate::notifications::{AuditLogService, NotificationService};
 use crate::service::{
-    ClaimPlanRequest, CreatePlanRequest, KycRecord, KycService, KycStatus, PlanService,
+    AdminMetrics, AdminService, ClaimMetricsService, ClaimPlanRequest, CreatePlanRequest,
+    KycRecord, KycService, KycStatus, PlanService, PlanStatisticsService, RevenueMetricsResponse,
+    RevenueMetricsService, UserMetricsService,
 };
 
 pub struct AppState {
@@ -41,11 +43,13 @@ pub async fn create_app(db: PgPool, config: Config) -> Result<Router, ApiError> 
         .route("/health/db", get(db_health_check))
         .route("/login", post(crate::auth::login_user))
         .route("/admin/login", post(crate::auth::login_admin))
+        .route("/api/auth/nonce", post(crate::auth::get_nonce))
         .route(
             "/api/auth/nonce/:wallet_address",
             get(crate::auth::generate_nonce),
         )
-        .route("/api/auth/wallet-login", post(crate::auth::wallet_login))
+        .route("/api/auth/web3-login", post(crate::auth::web3_login))
+        .route("/api/auth/wallet-login", post(crate::auth::web3_login))
         .layer(
             ServiceBuilder::new()
                 .layer(axum::middleware::from_fn_with_state(
@@ -82,12 +86,18 @@ pub async fn create_app(db: PgPool, config: Config) -> Result<Router, ApiError> 
         .route("/api/admin/kyc/:user_id", get(get_kyc_status))
         .route("/api/admin/kyc/approve", post(approve_kyc))
         .route("/api/admin/kyc/reject", post(reject_kyc))
+        .route("/admin/metrics/overview", get(get_admin_metrics_overview))
         .route("/api/kyc", get(get_user_kyc))
         // ── Notifications ────────────────────────────────────────────────
         .route("/api/notifications", get(list_notifications))
         .route("/api/notifications/:id/read", patch(mark_notification_read))
         // ── Admin Audit Logs ─────────────────────────────────────────────
         .route("/api/admin/logs", get(list_audit_logs))
+        // ── Admin Metrics ────────────────────────────────────────────────
+        .route("/api/admin/metrics/plans", get(get_plan_statistics))
+        .route("/admin/metrics/claims", get(get_claim_statistics))
+        .route("/admin/metrics/users", get(get_user_growth_metrics))
+        .route("/admin/metrics/revenue", get(get_revenue_metrics))
         .with_state(state);
 
     Ok(app)
@@ -225,12 +235,20 @@ async fn get_plan(
     Path(plan_id): Path<Uuid>,
     AuthenticatedUser(user): AuthenticatedUser,
 ) -> Result<Json<Value>, ApiError> {
-    let plan = PlanService::get_plan_by_id(&state.db, plan_id, user.user_id).await?;
+    let plan = PlanService::get_plan_by_id_any_user(&state.db, plan_id).await?;
     match plan {
-        Some(p) => Ok(Json(json!({
-            "status": "success",
-            "data": p
-        }))),
+        Some(p) => {
+            if p.user_id != user.user_id {
+                return Err(ApiError::Forbidden(format!(
+                    "You do not have permission to access plan {}",
+                    plan_id
+                )));
+            }
+            Ok(Json(json!({
+                "status": "success",
+                "data": p
+            })))
+        }
         None => Err(ApiError::NotFound(format!("Plan {} not found", plan_id))),
     }
 }
@@ -280,6 +298,8 @@ async fn cancel_plan(
     Path(plan_id): Path<Uuid>,
     AuthenticatedUser(user): AuthenticatedUser,
 ) -> Result<Json<Value>, ApiError> {
+    // Pass only the pool (&state.db) as the service now handles
+    // its own internal transaction orchestration.
     let plan = PlanService::cancel_plan(&state.db, plan_id, user.user_id).await?;
 
     Ok(Json(json!({
@@ -423,5 +443,63 @@ async fn list_audit_logs(
         "status": "success",
         "data": logs,
         "count": logs.len()
+    })))
+}
+
+async fn get_admin_metrics_overview(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedAdmin(_admin): AuthenticatedAdmin,
+) -> Result<Json<AdminMetrics>, ApiError> {
+    let metrics = AdminService::get_metrics_overview(&state.db).await?;
+    Ok(Json(metrics))
+}
+
+// ── Admin Metrics Handler ─────────────────────────────────────────────────────
+
+async fn get_plan_statistics(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedAdmin(_admin): AuthenticatedAdmin,
+) -> Result<Json<Value>, ApiError> {
+    let stats = PlanStatisticsService::get_plan_statistics(&state.db).await?;
+    Ok(Json(json!({
+        "status": "success",
+        "data": stats
+    })))
+}
+
+async fn get_user_growth_metrics(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedAdmin(_admin): AuthenticatedAdmin,
+) -> Result<Json<Value>, ApiError> {
+    let metrics = UserMetricsService::get_user_growth_metrics(&state.db).await?;
+    Ok(Json(json!({
+        "status": "success",
+        "data": metrics
+    })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct RevenueMetricsQuery {
+    pub range: Option<String>,
+}
+
+async fn get_revenue_metrics(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedAdmin(_admin): AuthenticatedAdmin,
+    Query(query): Query<RevenueMetricsQuery>,
+) -> Result<Json<RevenueMetricsResponse>, ApiError> {
+    let range = query.range.unwrap_or_else(|| "daily".to_string());
+    let metrics = RevenueMetricsService::get_revenue_breakdown(&state.db, &range).await?;
+    Ok(Json(metrics))
+}
+
+async fn get_claim_statistics(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedAdmin(_admin): AuthenticatedAdmin,
+) -> Result<Json<Value>, ApiError> {
+    let metrics = ClaimMetricsService::get_claim_statistics(&state.db).await?;
+    Ok(Json(json!({
+        "status": "success",
+        "data": metrics
     })))
 }
