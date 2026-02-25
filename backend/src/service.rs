@@ -408,9 +408,7 @@ impl PlanService {
         .map_err(|e| {
             if let sqlx::Error::Database(ref db_err) = e {
                 if db_err.is_unique_violation() {
-                    return ApiError::BadRequest(
-                        "This plan has already been claimed".to_string(),
-                    );
+                    return ApiError::BadRequest("This plan has already been claimed".to_string());
                 }
             }
             ApiError::from(e)

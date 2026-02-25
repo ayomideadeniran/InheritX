@@ -81,7 +81,7 @@ async fn test_concurrent_claim_same_email_only_one_succeeds() {
 
     let user_id = Uuid::new_v4();
     let email = format!("test_{}@example.com", user_id);
-    
+
     // Insert user
     sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id)
@@ -158,7 +158,7 @@ async fn test_concurrent_claim_different_emails_only_one_succeeds() {
 
     let user_id = Uuid::new_v4();
     let email = format!("test_{}@example.com", user_id);
-    
+
     // Insert user
     sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id)
@@ -193,8 +193,10 @@ async fn test_concurrent_claim_different_emails_only_one_succeeds() {
 
     // Send both claims in parallel with different emails
     let (resp1, resp2) = join!(
-        app.clone().oneshot(claim_req_with_email("beneficiary1@test.com")),
-        app.clone().oneshot(claim_req_with_email("beneficiary2@test.com"))
+        app.clone()
+            .oneshot(claim_req_with_email("beneficiary1@test.com")),
+        app.clone()
+            .oneshot(claim_req_with_email("beneficiary2@test.com"))
     );
 
     let status1 = resp1.expect("claim1 request failed").status();
@@ -233,7 +235,7 @@ async fn test_concurrent_claim_updates_plan_status() {
 
     let user_id = Uuid::new_v4();
     let email = format!("test_{}@example.com", user_id);
-    
+
     // Insert user
     sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id)
@@ -264,7 +266,11 @@ async fn test_concurrent_claim_updates_plan_status() {
         ))
         .unwrap();
 
-    let resp = app.clone().oneshot(claim_req).await.expect("claim request failed");
+    let resp = app
+        .clone()
+        .oneshot(claim_req)
+        .await
+        .expect("claim request failed");
     assert_eq!(resp.status(), StatusCode::OK, "Claim should succeed");
 
     // Verify plan status is updated to 'claimed'
@@ -292,7 +298,7 @@ async fn test_claim_after_concurrent_claims_fails() {
 
     let user_id = Uuid::new_v4();
     let email = format!("test_{}@example.com", user_id);
-    
+
     // Insert user
     sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id)
@@ -319,11 +325,16 @@ async fn test_claim_after_concurrent_claims_fails() {
         .header("Content-Type", "application/json")
         .header("X-User-Id", user_id.to_string())
         .body(Body::from(
-            serde_json::to_string(&json!({ "beneficiary_email": "first@beneficiary.com" })).unwrap(),
+            serde_json::to_string(&json!({ "beneficiary_email": "first@beneficiary.com" }))
+                .unwrap(),
         ))
         .unwrap();
 
-    let resp1 = app.clone().oneshot(claim_req).await.expect("claim request failed");
+    let resp1 = app
+        .clone()
+        .oneshot(claim_req)
+        .await
+        .expect("claim request failed");
     assert_eq!(resp1.status(), StatusCode::OK, "First claim should succeed");
 
     // Submit second claim with different email (should fail - already claimed)
@@ -333,12 +344,17 @@ async fn test_claim_after_concurrent_claims_fails() {
         .header("Content-Type", "application/json")
         .header("X-User-Id", user_id.to_string())
         .body(Body::from(
-            serde_json::to_string(&json!({ "beneficiary_email": "second@beneficiary.com" })).unwrap(),
+            serde_json::to_string(&json!({ "beneficiary_email": "second@beneficiary.com" }))
+                .unwrap(),
         ))
         .unwrap();
 
-    let resp2 = app.clone().oneshot(claim_req2).await.expect("second claim request failed");
-    
+    let resp2 = app
+        .clone()
+        .oneshot(claim_req2)
+        .await
+        .expect("second claim request failed");
+
     // Should fail with 400 Bad Request since plan is already claimed
     assert_eq!(
         resp2.status(),
@@ -361,7 +377,7 @@ async fn test_concurrent_claim_creates_single_audit_log() {
 
     let user_id = Uuid::new_v4();
     let email = format!("test_{}@example.com", user_id);
-    
+
     // Insert user
     sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
         .bind(user_id)
@@ -396,8 +412,10 @@ async fn test_concurrent_claim_creates_single_audit_log() {
 
     // Send both claims in parallel
     let (resp1, resp2) = join!(
-        app.clone().oneshot(claim_req_with_email("beneficiary1@test.com")),
-        app.clone().oneshot(claim_req_with_email("beneficiary2@test.com"))
+        app.clone()
+            .oneshot(claim_req_with_email("beneficiary1@test.com")),
+        app.clone()
+            .oneshot(claim_req_with_email("beneficiary2@test.com"))
     );
 
     let status1 = resp1.expect("claim1 request failed").status();
