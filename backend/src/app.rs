@@ -16,6 +16,7 @@ use crate::api_error::ApiError;
 use crate::auth::{AuthenticatedAdmin, AuthenticatedUser};
 use crate::beneficiary_sync::{BeneficiarySyncService, DocumentBeneficiary};
 use crate::config::Config;
+use crate::document_storage::DocumentStorageService;
 use crate::governance::{
     CreateProposalRequest, GovernanceService, ParameterUpdateRequest, Proposal, VoteRequest,
 };
@@ -29,11 +30,15 @@ use crate::service::{
     UnpausePlanRequest, UpdateEmergencyContactRequest,
 };
 use crate::stress_testing::StressTestingEngine;
+use crate::will_compliance::{ValidationResult, WillComplianceService};
 use crate::will_pdf::{WillDocumentInput, WillPdfService, WillTemplate};
 use crate::will_signature::{
     SigningChallengeRequest, SubmitSignatureRequest, WillSignatureService,
 };
+use crate::will_version::{PaginatedVersions, PaginationParams, WillVersionService};
+use crate::witness::{InviteWitnessRequest, WitnessService, WitnessSignRequest};
 use crate::yield_service::{DefaultOnChainYieldService, OnChainYieldService};
+use base64::Engine as _;
 
 pub struct AppState {
     pub db: PgPool,
@@ -254,6 +259,20 @@ pub async fn create_app(db: PgPool, config: Config) -> Result<Router, ApiError> 
             "/api/plans/:plan_id/will/documents",
             get(list_will_documents),
         )
+        // ── Will Version Management ──────────────────────────────────────────
+        .route("/api/plans/:plan_id/will/versions", get(list_will_versions))
+        .route(
+            "/api/plans/:plan_id/will/versions/active",
+            get(get_active_will_version),
+        )
+        .route(
+            "/api/plans/:plan_id/will/versions/:version_number",
+            get(get_will_version),
+        )
+        .route(
+            "/api/plans/:plan_id/will/versions/:version_number/finalize",
+            put(finalize_will_version),
+        )
         // ── Beneficiary Sync (Task 3) ─────────────────────────────────────────
         .route(
             "/api/plans/:plan_id/beneficiaries/sync",
@@ -268,6 +287,47 @@ pub async fn create_app(db: PgPool, config: Config) -> Result<Router, ApiError> 
         .route(
             "/api/will/documents/:document_id/signatures",
             get(get_will_signatures),
+        )
+        // -- Encrypted Document Storage (Issue #328) --
+        .route(
+            "/api/will/documents/:document_id/encrypt",
+            post(encrypt_document),
+        )
+        .route(
+            "/api/will/documents/:document_id/decrypt",
+            get(decrypt_document),
+        )
+        .route(
+            "/api/will/documents/:document_id/backup",
+            post(create_document_backup),
+        )
+        .route(
+            "/api/will/documents/:document_id/backups",
+            get(list_document_backups),
+        )
+        // -- Will Compliance Validation (Issue #330) --
+        .route("/api/will/validate", post(validate_will_compliance))
+        .route("/api/will/jurisdictions", get(list_jurisdictions))
+        .route(
+            "/api/will/jurisdictions/:jurisdiction",
+            get(get_jurisdiction_rules),
+        )
+        // -- Witness Verification (Issue #331) --------------------------------
+        .route(
+            "/api/will/documents/:document_id/witnesses",
+            post(invite_witness).get(list_witnesses),
+        )
+        .route(
+            "/api/will/documents/:document_id/witnesses/status",
+            get(get_witness_status),
+        )
+        .route(
+            "/api/will/witnesses/:witness_id/sign",
+            post(sign_as_witness),
+        )
+        .route(
+            "/api/will/witnesses/:witness_id/decline",
+            post(decline_witness),
         )
         .with_state(state);
 
@@ -1052,6 +1112,55 @@ async fn list_will_documents(
     ))
 }
 
+// ─── Will Version Handlers ────────────────────────────────────────────────────
+
+async fn list_will_versions(
+    State(state): State<Arc<AppState>>,
+    Path(plan_id): Path<Uuid>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<Value>, ApiError> {
+    let page = params.page.unwrap_or(1).max(1);
+    let per_page = params.per_page.unwrap_or(10).clamp(1, 100);
+    let (versions, total) =
+        WillVersionService::get_all_versions(&state.db, plan_id, user.user_id, page, per_page)
+            .await?;
+    Ok(Json(json!({
+        "status": "success",
+        "data": PaginatedVersions { versions, total, page, per_page }
+    })))
+}
+
+async fn get_active_will_version(
+    State(state): State<Arc<AppState>>,
+    Path(plan_id): Path<Uuid>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<Value>, ApiError> {
+    let version = WillVersionService::get_active_version(&state.db, plan_id, user.user_id).await?;
+    Ok(Json(json!({ "status": "success", "data": version })))
+}
+
+async fn get_will_version(
+    State(state): State<Arc<AppState>>,
+    Path((plan_id, version_number)): Path<(Uuid, u32)>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<Value>, ApiError> {
+    let doc =
+        WillVersionService::get_version(&state.db, plan_id, user.user_id, version_number).await?;
+    Ok(Json(json!({ "status": "success", "data": doc })))
+}
+
+async fn finalize_will_version(
+    State(state): State<Arc<AppState>>,
+    Path((plan_id, version_number)): Path<(Uuid, u32)>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<Value>, ApiError> {
+    let version =
+        WillVersionService::finalize_version(&state.db, plan_id, user.user_id, version_number)
+            .await?;
+    Ok(Json(json!({ "status": "success", "data": version })))
+}
+
 // ─── Beneficiary Sync Handler (Task 3) ───────────────────────────────────────
 
 #[derive(serde::Deserialize)]
@@ -1109,4 +1218,160 @@ async fn get_will_signatures(
     Ok(Json(
         json!({ "status": "success", "data": sigs, "count": sigs.len() }),
     ))
+}
+
+// -- Encrypted Document Storage Handlers (Issue #328) -------------------------
+
+async fn encrypt_document(
+    State(state): State<Arc<AppState>>,
+    Path(document_id): Path<Uuid>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<Value>, ApiError> {
+    let doc = WillPdfService::get_document(&state.db, document_id, user.user_id).await?;
+    let content_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&doc.pdf_base64)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("Base64 decode error: {e}")))?;
+
+    DocumentStorageService::store_encrypted(&state.db, user.user_id, document_id, &content_bytes)
+        .await?;
+
+    Ok(Json(json!({
+        "status": "success",
+        "message": "Document encrypted successfully",
+        "document_id": document_id
+    })))
+}
+
+async fn decrypt_document(
+    State(state): State<Arc<AppState>>,
+    Path(document_id): Path<Uuid>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<Value>, ApiError> {
+    let plaintext =
+        DocumentStorageService::retrieve_decrypted(&state.db, user.user_id, document_id).await?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&plaintext);
+
+    Ok(Json(json!({
+        "status": "success",
+        "document_id": document_id,
+        "pdf_base64": encoded
+    })))
+}
+
+async fn create_document_backup(
+    State(state): State<Arc<AppState>>,
+    Path(document_id): Path<Uuid>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<Value>, ApiError> {
+    let backup =
+        DocumentStorageService::create_backup(&state.db, user.user_id, document_id).await?;
+    Ok(Json(json!({ "status": "success", "data": backup })))
+}
+
+async fn list_document_backups(
+    State(state): State<Arc<AppState>>,
+    Path(document_id): Path<Uuid>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<Value>, ApiError> {
+    let backups =
+        DocumentStorageService::list_backups(&state.db, user.user_id, document_id).await?;
+    Ok(Json(
+        json!({ "status": "success", "data": backups, "count": backups.len() }),
+    ))
+}
+
+// -- Will Compliance Validation Handlers (Issue #330) --
+
+#[derive(serde::Deserialize)]
+struct ValidateWillRequest {
+    #[serde(flatten)]
+    input: WillDocumentInput,
+    witness_count: u32,
+}
+
+async fn validate_will_compliance(
+    AuthenticatedUser(_user): AuthenticatedUser,
+    Json(req): Json<ValidateWillRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let result: ValidationResult = WillComplianceService::validate(&req.input, req.witness_count);
+    Ok(Json(json!({ "status": "success", "data": result })))
+}
+
+async fn list_jurisdictions(
+    AuthenticatedUser(_user): AuthenticatedUser,
+) -> Result<Json<Value>, ApiError> {
+    let jurisdictions = WillComplianceService::list_supported_jurisdictions();
+    Ok(Json(
+        json!({ "status": "success", "data": jurisdictions, "count": jurisdictions.len() }),
+    ))
+}
+
+async fn get_jurisdiction_rules(
+    AuthenticatedUser(_user): AuthenticatedUser,
+    Path(jurisdiction): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let rules = WillComplianceService::get_jurisdiction_rules(&jurisdiction);
+    Ok(Json(json!({ "status": "success", "data": rules })))
+}
+
+// -- Witness Verification (Issue #331) ----------------------------------------
+
+async fn invite_witness(
+    State(state): State<Arc<AppState>>,
+    Path(document_id): Path<Uuid>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Json(req): Json<InviteWitnessRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let record = WitnessService::invite_witness(
+        &state.db,
+        user.user_id,
+        document_id,
+        req.wallet_address,
+        req.email,
+    )
+    .await?;
+    Ok(Json(json!({ "status": "success", "data": record })))
+}
+
+async fn list_witnesses(
+    State(state): State<Arc<AppState>>,
+    Path(document_id): Path<Uuid>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<Value>, ApiError> {
+    let witnesses = WitnessService::get_witnesses(&state.db, user.user_id, document_id).await?;
+    Ok(Json(
+        json!({ "status": "success", "data": witnesses, "count": witnesses.len() }),
+    ))
+}
+
+async fn get_witness_status(
+    State(state): State<Arc<AppState>>,
+    Path(document_id): Path<Uuid>,
+    AuthenticatedUser(_user): AuthenticatedUser,
+) -> Result<Json<Value>, ApiError> {
+    let summary = WitnessService::get_witness_status(&state.db, document_id).await?;
+    Ok(Json(json!({ "status": "success", "data": summary })))
+}
+
+async fn sign_as_witness(
+    State(state): State<Arc<AppState>>,
+    Path(witness_id): Path<Uuid>,
+    Json(req): Json<WitnessSignRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let record = WitnessService::sign_as_witness(
+        &state.db,
+        witness_id,
+        &req.wallet_address,
+        &req.signature_hex,
+    )
+    .await?;
+    Ok(Json(json!({ "status": "success", "data": record })))
+}
+
+async fn decline_witness(
+    State(state): State<Arc<AppState>>,
+    Path(witness_id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let record = WitnessService::decline_witness(&state.db, witness_id).await?;
+    Ok(Json(json!({ "status": "success", "data": record })))
 }
