@@ -28,6 +28,7 @@ pub mod safe_math;
 pub mod service;
 pub mod stress_testing;
 pub mod telemetry;
+pub mod will_audit;
 pub mod will_compliance;
 pub mod will_events;
 pub mod will_pdf;
