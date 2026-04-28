@@ -393,6 +393,7 @@ pub struct InsuranceCancelledEvent {
     pub loan_id: u64,
     pub borrower: Address,
     pub refund_amount: u64,
+    pub timestamp: u64,
 }
 
 #[contracttype]
@@ -439,14 +440,14 @@ pub enum LendingError {
     InvalidRewardRate = 23,
     PoolPaused = 24,
     AssetNotSupported = 25,
-    InsuranceAlreadyPurchased = 24,
-    InsuranceNotFound = 25,
-    InsuranceExpired = 26,
-    InsuranceAlreadyClaimed = 27,
-    InsufficientInsuranceFund = 28,
-    InvalidInsuranceAmount = 29,
-    InvalidRateModel = 24,
-    ContractPaused = 25,
+    InsuranceAlreadyPurchased = 26,
+    InsuranceNotFound = 27,
+    InsuranceExpired = 28,
+    InsuranceAlreadyClaimed = 29,
+    InsufficientInsuranceFund = 30,
+    InvalidInsuranceAmount = 31,
+    InvalidRateModel = 32,
+    ContractPaused = 33,
 }
 
 // ─────────────────────────────────────────────────
@@ -478,6 +479,7 @@ pub enum DataKey {
     InheritanceContract,
     GovernanceContract,
     RateModel,
+    Token, // Underlying token address for insurance operations
 }
 
 // ─────────────────────────────────────────────────
@@ -507,6 +509,9 @@ impl LendingContract {
             return Err(LendingError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+
+        // Store the primary token address for insurance operations
+        env.storage().instance().set(&DataKey::Token, &token);
 
         let mut assets = Vec::new(&env);
         assets.push_back(token.clone());
@@ -1062,7 +1067,12 @@ impl LendingContract {
 
     /// Deposit `amount` of the specific asset into its pool.
     /// Mints proportional pool shares to the depositor.
-    pub fn deposit(env: Env, depositor: Address, amount: u64) -> Result<u64, LendingError> {
+    pub fn deposit(
+        env: Env,
+        depositor: Address,
+        asset: Address,
+        amount: u64,
+    ) -> Result<u64, LendingError> {
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         Self::enter_reentrancy_guard(&env)?;
@@ -1123,7 +1133,12 @@ impl LendingContract {
 
     /// Burn `shares` and return the proportional underlying tokens to the depositor.
     /// Reverts if insufficient liquidity (i.e., tokens are loaned out).
-    pub fn withdraw(env: Env, depositor: Address, shares: u64) -> Result<u64, LendingError> {
+    pub fn withdraw(
+        env: Env,
+        depositor: Address,
+        asset: Address,
+        shares: u64,
+    ) -> Result<u64, LendingError> {
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         Self::enter_reentrancy_guard(&env)?;
@@ -1518,7 +1533,12 @@ impl LendingContract {
 
     /// Withdraw prioritized funds from the retained yield for a specific asset.
     /// Used by authorized contracts (like InheritanceContract) to fulfill priority claims.
-    pub fn withdraw_priority(env: Env, caller: Address, amount: u64) -> Result<u64, LendingError> {
+    pub fn withdraw_priority(
+        env: Env,
+        caller: Address,
+        asset: Address,
+        amount: u64,
+    ) -> Result<u64, LendingError> {
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         Self::enter_reentrancy_guard(&env)?;
@@ -1797,7 +1817,12 @@ impl LendingContract {
         Ok(())
     }
 
-    pub fn flash_loan(env: Env, receiver_id: Address, amount: u64) -> Result<(), LendingError> {
+    pub fn flash_loan(
+        env: Env,
+        receiver_id: Address,
+        asset: Address,
+        amount: u64,
+    ) -> Result<(), LendingError> {
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         Self::enter_reentrancy_guard(&env)?;
@@ -1932,6 +1957,7 @@ impl LendingContract {
             (symbol_short!("STAKE"), symbol_short!("LP")),
             StakedEvent {
                 user: user.clone(),
+                asset: asset.clone(),
                 amount,
                 timestamp: env.ledger().timestamp(),
             },
@@ -2012,6 +2038,7 @@ impl LendingContract {
             (symbol_short!("UNSTAKE"), symbol_short!("LP")),
             UnstakedEvent {
                 user: user.clone(),
+                asset: asset.clone(),
                 amount,
                 rewards_claimed: rewards_to_claim,
                 timestamp: env.ledger().timestamp(),
@@ -2060,6 +2087,7 @@ impl LendingContract {
             (symbol_short!("CLAIM"), symbol_short!("REWARDS")),
             RewardsClaimedEvent {
                 user: user.clone(),
+                asset: asset.clone(),
                 rewards: rewards_to_claim,
                 timestamp: env.ledger().timestamp(),
             },
@@ -2932,7 +2960,7 @@ impl LendingContract {
         let total_interest =
             Self::calculate_interest(loan.principal, loan.interest_rate_bps, elapsed);
 
-        let mut pool = Self::get_pool_state(env.clone())?;
+        let mut pool = Self::get_pool(&env, &loan.asset)?;
         let (depositor_interest, protocol_interest) =
             Self::calculate_interest_split(total_interest, pool.reserve_factor_bps);
 
@@ -2943,7 +2971,7 @@ impl LendingContract {
             .total_protocol_revenue
             .saturating_add(protocol_interest);
 
-        Self::set_pool(&env, &pool);
+        Self::set_pool(&env, &loan.asset, &pool);
 
         log!(
             &env,
@@ -3568,7 +3596,8 @@ impl LendingContract {
         {
             return Ok(model.base_rate_bps);
         }
-        Ok(Self::get_pool(&env).base_rate_bps)
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        Ok(Self::get_pool(&env, &token)?.base_rate_bps)
     }
 
     /// Get the optimal (target) utilization rate from the rate model.
@@ -3582,7 +3611,8 @@ impl LendingContract {
             return Ok(model.optimal_utilization_bps);
         }
         // Default: use utilization cap as the optimal target
-        Ok(Self::get_pool(&env).utilization_cap_bps)
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        Ok(Self::get_pool(&env, &token)?.utilization_cap_bps)
     }
 
     /// Get slope1 — the rate increase per unit utilization before optimal utilization.
@@ -3596,7 +3626,8 @@ impl LendingContract {
             return Ok(model.slope1_bps);
         }
         // Fallback: use pool multiplier as slope1
-        Ok(Self::get_pool(&env).multiplier_bps)
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        Ok(Self::get_pool(&env, &token)?.multiplier_bps)
     }
 
     /// Get slope2 — the steep rate increase per unit utilization above optimal utilization.
@@ -3610,14 +3641,16 @@ impl LendingContract {
             return Ok(model.slope2_bps);
         }
         // Fallback: slope2 is 10× slope1 when not configured
-        Ok(Self::get_pool(&env).multiplier_bps.saturating_mul(10))
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        Ok(Self::get_pool(&env, &token)?.multiplier_bps.saturating_mul(10))
     }
 
     /// Get the current borrow rate using the two-slope model if configured,
     /// or the legacy linear model otherwise.
     pub fn get_borrow_rate(env: Env) -> Result<u32, LendingError> {
         Self::require_initialized(&env)?;
-        let pool = Self::get_pool(&env);
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let pool = Self::get_pool(&env, &token)?;
         let utilization_bps = Self::get_utilization_bps(pool.total_borrowed, pool.total_deposits);
 
         if let Some(model) = env
@@ -3639,7 +3672,8 @@ impl LendingContract {
     /// supply_rate = borrow_rate × utilization × (1 − reserve_factor)
     pub fn get_supply_rate(env: Env) -> Result<u32, LendingError> {
         Self::require_initialized(&env)?;
-        let pool = Self::get_pool(&env);
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let pool = Self::get_pool(&env, &token)?;
         let utilization_bps = Self::get_utilization_bps(pool.total_borrowed, pool.total_deposits);
         let borrow_rate = Self::get_borrow_rate(env.clone())?;
 
@@ -3675,7 +3709,8 @@ impl LendingContract {
         {
             return Ok(Self::two_slope_rate(&model, utilization_bps));
         }
-        let pool = Self::get_pool(&env);
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let pool = Self::get_pool(&env, &token)?;
         Ok(Self::calculate_dynamic_rate(
             pool.base_rate_bps,
             pool.multiplier_bps,

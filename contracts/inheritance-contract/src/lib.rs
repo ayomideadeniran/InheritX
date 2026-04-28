@@ -64,6 +64,7 @@ pub struct InheritancePlan {
     pub waterfall_enabled: bool,
 }
 
+#[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InheritanceError {
     InvalidAssetType = 1,
@@ -98,31 +99,6 @@ pub enum InheritanceError {
     FeeTransferFailed = 30,
     InsufficientLiquidity = 31,
     InheritanceAlreadyTriggered = 32,
-    InheritanceNotTriggered = 33,
-    LoanRecallFailed = 34,
-    NoOutstandingLoans = 35,
-    EmergencyAccessAlreadyActive = 36,
-    EmergencyCooldownActive = 37,
-    InvalidGuardianThreshold = 38,
-    GuardianNotFound = 39,
-    AlreadyApproved = 40,
-    EmergencyContactNotFound = 41,
-    EmergencyContactAlreadyExists = 42,
-    TooManyEmergencyContacts = 43,
-    WillHashAlreadyStored = 44,
-    WillAlreadyLinked = 45,
-    VaultNotFound = 46,
-    VerificationFailed = 47,
-    WillVersionNotFound = 48,
-    WillAlreadyFinalized = 49,
-    WillNotVerified = 50,
-    VestingScheduleNotFound = 51,
-    VestingScheduleExists = 52,
-    VestingAlreadyStarted = 53,
-    VestingScheduleActive = 54,
-    InvalidVestingParams = 55,
-    NothingToClaim = 56,
-    VestingExitSettlementPending = 57,
 }
 
 #[contracttype]
@@ -170,6 +146,7 @@ pub enum DataKey {
     LegalHold(u64),                  // plan_id -> LegalHold
     FrozenBeneficiary(u64, u32),     // (plan_id, index) -> bool
     TriggerConditions(u64),          // plan_id -> TriggerConfig
+    VestingExitSettlement(u64, u32), // (plan_id, beneficiary_index) -> exit settlement data
 }
 
 #[contracttype]
@@ -1846,6 +1823,22 @@ impl InheritanceContract {
             .unwrap_or(0) as u64;
 
         entitlement.min(plan.total_amount)
+    }
+
+    /// Check if a beneficiary has an active vesting schedule
+    fn has_active_vesting_schedule(_env: &Env, _plan_id: u64, _beneficiary_index: u32) -> bool {
+        // For MVP, we don't implement vesting schedules yet
+        // This is a placeholder that always returns false
+        false
+    }
+
+    /// Get vesting exit settlement amount for a beneficiary
+    fn get_vesting_exit_settlement(env: &Env, plan_id: u64, beneficiary_index: u32) -> u64 {
+        let settle_key = DataKey::VestingExitSettlement(plan_id, beneficiary_index);
+        env.storage()
+            .persistent()
+            .get(&settle_key)
+            .unwrap_or(0u64)
     }
 
     pub fn get_claimable_by_priority(
@@ -5185,7 +5178,7 @@ impl InheritanceContract {
             PlanOwnershipTransferredEvent {
                 plan_id,
                 old_owner,
-                new_owner,
+                new_owner: new_owner.clone(),
                 transferred_at: env.ledger().timestamp(),
             },
         );
