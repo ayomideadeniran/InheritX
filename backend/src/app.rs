@@ -59,6 +59,7 @@ use crate::service::{
 };
 use crate::session::{list_sessions, logout, logout_all, revoke_session, session_guard_middleware};
 use crate::stress_testing::StressTestingEngine;
+use crate::webhook::{delete_webhook, get_webhooks, register_webhook, WebhookService};
 use crate::will_compliance::{ValidationResult, WillComplianceService};
 use crate::will_pdf::{WillDocumentInput, WillPdfService, WillTemplate};
 use crate::will_signature::{
@@ -75,6 +76,7 @@ pub struct AppState {
     pub yield_service: Arc<dyn OnChainYieldService>,
     pub stress_testing_engine: Arc<StressTestingEngine>,
     pub insurance_fund_service: Arc<crate::insurance_fund::InsuranceFundService>,
+    pub webhook_service: Arc<WebhookService>,
 }
 
 pub async fn create_app(
@@ -109,12 +111,15 @@ pub async fn create_app(
         Arc::new(crate::insurance_fund::InsuranceFundService::new(db.clone()));
     insurance_fund_service.clone().start();
 
+    let webhook_service = Arc::new(WebhookService::new(db.clone()));
+
     let state = Arc::new(AppState {
         db: db.clone(),
         config: config.clone(),
         yield_service,
         stress_testing_engine,
         insurance_fund_service,
+        webhook_service,
     });
 
     // ── Rate limiting (config-driven) ────────────────────────────────────────
@@ -593,6 +598,9 @@ pub async fn create_app(
         .route("/api/admin/will/audit/search", get(search_admin_audit_logs))
         .route("/api/admin/logs", get(get_admin_logs))
         .route("/api/notifications", get(get_notifications))
+        // ── Webhook System ───────────────────────────────────────────────────
+        .route("/api/webhooks", post(register_webhook).get(get_webhooks))
+        .route("/api/webhooks/:webhook_id", delete(delete_webhook))
         .route(
             "/api/admin/will/audit/user/:user_id",
             get(get_user_audit_activity),
