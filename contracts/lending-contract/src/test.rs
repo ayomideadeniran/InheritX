@@ -2023,6 +2023,94 @@ fn test_yield_farming_functions_exposed() {
 }
 
 // ─────────────────────────────────────────────────
+// Insurance Tests
+// ─────────────────────────────────────────────────
+
+#[test]
+fn test_insurance_premium_calculation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, admin) = setup(&env);
+
+    // Test premium calculation for various loan amounts
+    let premium_100 = client.get_insurance_premium(&100u64).unwrap();
+    // 100 * 2% = 2
+    assert_eq!(premium_100, 2u64);
+
+    let premium_1000 = client.get_insurance_premium(&1000u64).unwrap();
+    // 1000 * 2% = 20
+    assert_eq!(premium_1000, 20u64);
+
+    let premium_10000 = client.get_insurance_premium(&10000u64).unwrap();
+    // 10000 * 2% = 200
+    assert_eq!(premium_10000, 200u64);
+}
+
+#[test]
+fn test_set_insurance_premium_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, admin) = setup(&env);
+
+    // Admin can set premium rate
+    client.set_insurance_premium_rate(&admin, &500u32); // 5%
+
+    let premium = client.get_insurance_premium(&1000u64).unwrap();
+    // 1000 * 5% = 50
+    assert_eq!(premium, 50u64);
+}
+
+#[test]
+fn test_purchase_loan_insurance_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, admin) = setup(&env);
+
+    let lender = Address::generate(&env);
+    let borrower = Address::generate(&env);
+
+    // Setup: lender deposits
+    mint_to(&env, &token_addr, &lender, 100_000);
+    client.deposit(&lender, &50_000u64);
+
+    // Setup: borrower borrows with collateral
+    mint_to(&env, &token_addr, &borrower, 10_000);
+    mint_to(&env, &collateral_addr, &borrower, 50_000);
+
+    client.borrow(
+        &borrower,
+        &token_addr,
+        &5_000u64,
+        &collateral_addr,
+        &10_000u64,
+        &7_200u64, // 2 hours
+    );
+
+    // Borrower has funds for premium
+    mint_to(&env, &token_addr, &borrower, 1_000);
+
+    // Purchase insurance for loan 0
+    let premium = client.purchase_loan_insurance(&borrower, &0u64).unwrap();
+    // Premium should be 2% of 5000 = 100
+    assert_eq!(premium, 100u64);
+
+    // Verify insurance exists
+    assert_eq!(client.is_loan_insured(&0u64).unwrap(), true);
+
+    let coverage = client.get_insurance_coverage(&0u64).unwrap();
+    assert_eq!(coverage, 5_000u64); // 100% coverage
+
+    let insurance = client.get_insurance_details(&0u64).unwrap();
+    assert!(insurance.is_some());
+    let ins = insurance.unwrap();
+    assert_eq!(ins.loan_id, 0);
+    assert_eq!(ins.borrower, borrower);
+    assert_eq!(ins.coverage_amount, 5_000u64);
+    assert_eq!(ins.premium_paid, 100u64);
+}
+
+#[test]
+fn test_cannot_purchase_insurance_twice() {
 // Interest Rate Model Tests (#489)
 // ─────────────────────────────────────────────────
 
@@ -2087,6 +2175,95 @@ fn test_get_borrow_rate_at_optimal() {
     env.mock_all_auths();
     let (client, token_addr, collateral_addr, admin) = setup(&env);
 
+    let lender = Address::generate(&env);
+    let borrower = Address::generate(&env);
+
+    // Setup: lender deposits and borrower borrows
+    mint_to(&env, &token_addr, &lender, 100_000);
+    client.deposit(&lender, &50_000u64);
+
+    mint_to(&env, &token_addr, &borrower, 10_000);
+    mint_to(&env, &collateral_addr, &borrower, 50_000);
+
+    client.borrow(
+        &borrower,
+        &token_addr,
+        &5_000u64,
+        &collateral_addr,
+        &10_000u64,
+        &7_200u64,
+    );
+
+    mint_to(&env, &token_addr, &borrower, 2_000);
+
+    // Purchase insurance first time
+    client.purchase_loan_insurance(&borrower, &0u64).unwrap();
+
+    // Try to purchase again - should fail
+    let result = client.try_purchase_loan_insurance(&borrower, &0u64);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_insurance_fund_tracking() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, admin) = setup(&env);
+
+    let lender = Address::generate(&env);
+    let borrower = Address::generate(&env);
+
+    // Setup
+    mint_to(&env, &token_addr, &lender, 100_000);
+    client.deposit(&lender, &50_000u64);
+
+    mint_to(&env, &token_addr, &borrower, 10_000);
+    mint_to(&env, &collateral_addr, &borrower, 50_000);
+
+    client.borrow(
+        &borrower,
+        &token_addr,
+        &5_000u64,
+        &collateral_addr,
+        &10_000u64,
+        &7_200u64,
+    );
+
+    mint_to(&env, &token_addr, &borrower, 1_000);
+
+    // Check initial fund state
+    let fund_before = client.get_insurance_fund_state().unwrap();
+    assert_eq!(fund_before.total_premiums_collected, 0);
+    assert_eq!(fund_before.total_claims_paid, 0);
+    assert_eq!(fund_before.available_balance, 0);
+
+    // Purchase insurance
+    let premium = client.purchase_loan_insurance(&borrower, &0u64).unwrap();
+
+    // Check fund state after purchase
+    let fund_after = client.get_insurance_fund_state().unwrap();
+    assert_eq!(fund_after.total_premiums_collected, premium);
+    assert_eq!(fund_after.available_balance, premium);
+    assert_eq!(fund_after.total_claims_paid, 0);
+}
+
+#[test]
+fn test_deposit_to_insurance_fund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, admin) = setup(&env);
+
+    mint_to(&env, &token_addr, &admin, 10_000);
+
+    // Deposit to insurance fund
+    client.deposit_to_insurance_fund(&admin, &5_000u64).unwrap();
+
+    let fund = client.get_insurance_fund_state().unwrap();
+    assert_eq!(fund.available_balance, 5_000u64);
+}
+
+#[test]
+fn test_claim_insurance_after_default() {
     // Deposit 2000 (must exceed MINIMUM_LIQUIDITY=1000 for first deposit)
     let depositor = Address::generate(&env);
     mint_to(&env, &token_addr, &depositor, 2000);
@@ -2159,6 +2336,93 @@ fn test_get_supply_rate() {
     env.mock_all_auths();
     let (client, token_addr, collateral_addr, admin) = setup(&env);
 
+    let lender = Address::generate(&env);
+    let borrower = Address::generate(&env);
+
+    // Setup
+    mint_to(&env, &token_addr, &lender, 100_000);
+    client.deposit(&lender, &50_000u64);
+
+    mint_to(&env, &token_addr, &borrower, 10_000);
+    mint_to(&env, &collateral_addr, &borrower, 50_000);
+
+    let loan_amount = 5_000u64;
+    let loan_duration = 7_200u64; // 2 hours
+    let due_date = env.ledger().timestamp() + loan_duration;
+
+    client.borrow(
+        &borrower,
+        &token_addr,
+        &loan_amount,
+        &collateral_addr,
+        &10_000u64,
+        &loan_duration,
+    );
+
+    mint_to(&env, &token_addr, &borrower, 1_000);
+
+    // Purchase insurance
+    let premium = client.purchase_loan_insurance(&borrower, &0u64).unwrap();
+
+    // Fund the insurance pool for claims
+    mint_to(&env, &token_addr, &admin, 20_000);
+    client.deposit_to_insurance_fund(&admin, &10_000u64).unwrap();
+
+    // Jump past due date
+    env.ledger().set_timestamp(due_date + 1);
+
+    // Claim insurance
+    let claim_amount = client.claim_insurance(&0u64).unwrap();
+    assert_eq!(claim_amount, loan_amount); // 100% coverage
+
+    // Verify insurance is marked as claimed
+    assert_eq!(client.is_loan_insured(&0u64).unwrap(), false);
+
+    // Verify fund was updated
+    let fund = client.get_insurance_fund_state().unwrap();
+    assert_eq!(fund.total_claims_paid, claim_amount);
+    assert_eq!(fund.available_balance, 10_000u64 - claim_amount);
+}
+
+#[test]
+fn test_cannot_claim_expired_insurance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, admin) = setup(&env);
+
+    let lender = Address::generate(&env);
+    let borrower = Address::generate(&env);
+
+    // Setup
+    mint_to(&env, &token_addr, &lender, 100_000);
+    client.deposit(&lender, &50_000u64);
+
+    mint_to(&env, &token_addr, &borrower, 10_000);
+    mint_to(&env, &collateral_addr, &borrower, 50_000);
+
+    let loan_amount = 5_000u64;
+    let loan_duration = 7_200u64;
+    let due_date = env.ledger().timestamp() + loan_duration;
+
+    client.borrow(
+        &borrower,
+        &token_addr,
+        &loan_amount,
+        &collateral_addr,
+        &10_000u64,
+        &loan_duration,
+    );
+
+    mint_to(&env, &token_addr, &borrower, 1_000);
+
+    // Purchase insurance
+    client.purchase_loan_insurance(&borrower, &0u64).unwrap();
+
+    // Jump past due date + some extra time
+    env.ledger().set_timestamp(due_date + 100_000);
+
+    // Try to claim - should fail because insurance expired
+    let result = client.try_claim_insurance(&0u64);
     // Deposit 2000 (must exceed MINIMUM_LIQUIDITY=1000 for first deposit)
     let depositor = Address::generate(&env);
     mint_to(&env, &token_addr, &depositor, 2000);
@@ -2229,6 +2493,145 @@ fn test_non_admin_cannot_assign_roles() {
 }
 
 #[test]
+fn test_cancel_insurance_with_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, admin) = setup(&env);
+
+    let lender = Address::generate(&env);
+    let borrower = Address::generate(&env);
+
+    // Setup
+    mint_to(&env, &token_addr, &lender, 100_000);
+    client.deposit(&lender, &50_000u64);
+
+    mint_to(&env, &token_addr, &borrower, 10_000);
+    mint_to(&env, &collateral_addr, &borrower, 50_000);
+
+    let loan_amount = 5_000u64;
+    let loan_duration = 7_200u64;
+    let due_date = env.ledger().timestamp() + loan_duration;
+
+    client.borrow(
+        &borrower,
+        &token_addr,
+        &loan_amount,
+        &collateral_addr,
+        &10_000u64,
+        &loan_duration,
+    );
+
+    mint_to(&env, &token_addr, &borrower, 1_000);
+
+    // Purchase insurance
+    let premium = client.purchase_loan_insurance(&borrower, &0u64).unwrap();
+
+    let fund_after_purchase = client.get_insurance_fund_state().unwrap();
+    let initial_balance = fund_after_purchase.available_balance;
+
+    // Cancel insurance halfway through the duration
+    let half_duration = loan_duration / 2;
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + half_duration);
+
+    let refund = client.cancel_insurance(&borrower, &0u64).unwrap();
+
+    // Refund should be approximately half the premium (pro-rata)
+    assert!(refund > 0);
+    assert!(refund < premium);
+
+    // Verify insurance is removed
+    assert_eq!(client.is_loan_insured(&0u64).unwrap(), false);
+
+    // Verify fund was updated
+    let fund_after_cancel = client.get_insurance_fund_state().unwrap();
+    assert_eq!(fund_after_cancel.available_balance, initial_balance - refund);
+}
+
+#[test]
+fn test_cancel_insurance_no_refund_after_expiry() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, admin) = setup(&env);
+
+    let lender = Address::generate(&env);
+    let borrower = Address::generate(&env);
+
+    // Setup
+    mint_to(&env, &token_addr, &lender, 100_000);
+    client.deposit(&lender, &50_000u64);
+
+    mint_to(&env, &token_addr, &borrower, 10_000);
+    mint_to(&env, &collateral_addr, &borrower, 50_000);
+
+    let loan_amount = 5_000u64;
+    let loan_duration = 7_200u64;
+    let due_date = env.ledger().timestamp() + loan_duration;
+
+    client.borrow(
+        &borrower,
+        &token_addr,
+        &loan_amount,
+        &collateral_addr,
+        &10_000u64,
+        &loan_duration,
+    );
+
+    mint_to(&env, &token_addr, &borrower, 1_000);
+
+    // Purchase insurance
+    client.purchase_loan_insurance(&borrower, &0u64).unwrap();
+
+    let fund_after_purchase = client.get_insurance_fund_state().unwrap();
+    let initial_balance = fund_after_purchase.available_balance;
+
+    // Jump past expiry
+    env.ledger().set_timestamp(due_date + 1);
+
+    // Cancel insurance after expiry
+    let refund = client.cancel_insurance(&borrower, &0u64).unwrap();
+
+    // No refund after expiry
+    assert_eq!(refund, 0);
+
+    // Fund balance should remain the same
+    let fund_after_cancel = client.get_insurance_fund_state().unwrap();
+    assert_eq!(fund_after_cancel.available_balance, initial_balance);
+}
+
+#[test]
+fn test_unauthorized_cancel_insurance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, admin) = setup(&env);
+
+    let lender = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    let unauthorized_user = Address::generate(&env);
+
+    // Setup
+    mint_to(&env, &token_addr, &lender, 100_000);
+    client.deposit(&lender, &50_000u64);
+
+    mint_to(&env, &token_addr, &borrower, 10_000);
+    mint_to(&env, &collateral_addr, &borrower, 50_000);
+
+    client.borrow(
+        &borrower,
+        &token_addr,
+        &5_000u64,
+        &collateral_addr,
+        &10_000u64,
+        &7_200u64,
+    );
+
+    mint_to(&env, &token_addr, &borrower, 1_000);
+
+    // Purchase insurance
+    client.purchase_loan_insurance(&borrower, &0u64).unwrap();
+
+    // Try to cancel as unauthorized user
+    let result = client.try_cancel_insurance(&unauthorized_user, &0u64);
 fn test_non_admin_cannot_whitelist_collateral() {
     let env = Env::default();
     env.mock_all_auths();
@@ -2266,6 +2669,87 @@ fn test_pause_blocks_deposit() {
 }
 
 #[test]
+fn test_withdraw_from_insurance_fund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, admin) = setup(&env);
+
+    mint_to(&env, &token_addr, &admin, 10_000);
+
+    // Deposit to insurance fund
+    client.deposit_to_insurance_fund(&admin, &5_000u64).unwrap();
+
+    let fund_before = client.get_insurance_fund_state().unwrap();
+    assert_eq!(fund_before.available_balance, 5_000u64);
+
+    // Withdraw from insurance fund
+    client.withdraw_from_insurance_fund(&admin, &2_000u64).unwrap();
+
+    let fund_after = client.get_insurance_fund_state().unwrap();
+    assert_eq!(fund_after.available_balance, 3_000u64);
+}
+
+#[test]
+fn test_insurance_lifecycle_complete() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, admin) = setup(&env);
+
+    let lender = Address::generate(&env);
+    let borrower = Address::generate(&env);
+
+    // Step 1: Lender deposits
+    mint_to(&env, &token_addr, &lender, 100_000);
+    client.deposit(&lender, &50_000u64);
+
+    // Step 2: Borrower borrows
+    mint_to(&env, &token_addr, &borrower, 10_000);
+    mint_to(&env, &collateral_addr, &borrower, 50_000);
+
+    let loan_amount = 5_000u64;
+    let loan_duration = 7_200u64;
+
+    client.borrow(
+        &borrower,
+        &token_addr,
+        &loan_amount,
+        &collateral_addr,
+        &10_000u64,
+        &loan_duration,
+    );
+
+    // Step 3: Borrower purchases insurance
+    mint_to(&env, &token_addr, &borrower, 1_000);
+    let premium = client.purchase_loan_insurance(&borrower, &0u64).unwrap();
+
+    assert_eq!(client.is_loan_insured(&0u64).unwrap(), true);
+
+    // Step 4: Fund insurance for potential claims
+    mint_to(&env, &token_addr, &admin, 20_000);
+    client.deposit_to_insurance_fund(&admin, &10_000u64).unwrap();
+
+    // Step 5: Verify fund state
+    let fund = client.get_insurance_fund_state().unwrap();
+    assert_eq!(fund.total_premiums_collected, premium);
+    assert_eq!(fund.available_balance, 10_000u64 + premium);
+
+    // Step 6: Loan defaults (jump past due date)
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + loan_duration + 1);
+
+    // Step 7: Claim insurance
+    let claim_amount = client.claim_insurance(&0u64).unwrap();
+    assert_eq!(claim_amount, loan_amount);
+
+    // Step 8: Verify final state
+    assert_eq!(client.is_loan_insured(&0u64).unwrap(), false);
+
+    let final_fund = client.get_insurance_fund_state().unwrap();
+    assert_eq!(final_fund.total_claims_paid, claim_amount);
+    assert_eq!(
+        final_fund.available_balance,
+        10_000u64 + premium - claim_amount
+    );
 fn test_unpause_restores_deposit() {
     let env = Env::default();
     env.mock_all_auths();

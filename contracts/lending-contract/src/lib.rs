@@ -20,6 +20,10 @@ const REFINANCING_FEE_BPS: u32 = 50; // 0.5% refinancing fee
 const DEFAULT_REWARD_RATE: u64 = 1_000_000_000; // Default reward rate per second (1 reward per second with 9 decimals)
 const REWARD_PRECISION: u64 = 1_000_000_000; // 9 decimals for reward calculations
 
+// Insurance constants
+const DEFAULT_INSURANCE_PREMIUM_RATE_BPS: u32 = 200; // 2% premium of loan principal
+const INSURANCE_CLAIM_PAYBACK_BPS: u32 = 10000; // 100% coverage
+
 // ─────────────────────────────────────────────────
 // Data Types
 // ─────────────────────────────────────────────────
@@ -77,6 +81,27 @@ pub struct LoanMetadata {
     pub collateral_amount: u64,
     pub collateral_token: Address,
     pub due_date: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoanInsurance {
+    pub loan_id: u64,
+    pub borrower: Address,
+    pub coverage_amount: u64,    // Coverage limit (typically 100% of loan principal)
+    pub premium_paid: u64,       // Premium amount paid upfront
+    pub premium_rate_bps: u32,   // Premium rate in basis points (e.g., 200 = 2%)
+    pub purchase_time: u64,      // Timestamp when insurance was purchased
+    pub expires_at: u64,         // Expiration timestamp (typically loan due date)
+    pub claimed: bool,           // Whether insurance has been claimed
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InsuranceFund {
+    pub total_premiums_collected: u64, // Total premiums accumulated
+    pub total_claims_paid: u64,        // Total claims paid out
+    pub available_balance: u64,        // Current available balance for claims
 }
 
 #[soroban_sdk::contractclient(name = "LoanNFTClient")]
@@ -302,6 +327,29 @@ pub struct RewardRateUpdatedEvent {
 }
 
 // ─────────────────────────────────────────────────
+// Insurance Events
+// ─────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InsurancePurchasedEvent {
+    pub loan_id: u64,
+    pub borrower: Address,
+    pub coverage_amount: u64,
+    pub premium_paid: u64,
+    pub premium_rate_bps: u32,
+    pub expires_at: u64,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InsuranceClaimedEvent {
+    pub loan_id: u64,
+    pub borrower: Address,
+    pub claim_amount: u64,
+    pub coverage_amount: u64,
+    pub timestamp: u64,
 // Interest Rate Model
 // ─────────────────────────────────────────────────
 
@@ -320,6 +368,10 @@ pub struct RateModel {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InsuranceCancelledEvent {
+    pub loan_id: u64,
+    pub borrower: Address,
+    pub refund_amount: u64,
 pub struct RateModelUpdatedEvent {
     pub base_rate_bps: u32,
     pub optimal_utilization_bps: u32,
@@ -360,6 +412,12 @@ pub enum LendingError {
     InsufficientStake = 21,
     NoRewardsToClaim = 22,
     InvalidRewardRate = 23,
+    InsuranceAlreadyPurchased = 24,
+    InsuranceNotFound = 25,
+    InsuranceExpired = 26,
+    InsuranceAlreadyClaimed = 27,
+    InsufficientInsuranceFund = 28,
+    InvalidInsuranceAmount = 29,
     InvalidRateModel = 24,
     ContractPaused = 25,
 }
@@ -387,6 +445,9 @@ pub enum DataKey {
     UserLoans(Address), // Track multiple loans per user (Vec<u64>)
     RewardPool,
     UserStake(Address), // Track user's staking position
+    Insurance(u64),            // Insurance record for a loan_id
+    InsuranceFund,             // Global insurance fund state
+    InsurancePremiumRate,      // Premium rate in basis points (default 200 = 2%)
     InheritanceContract,
     GovernanceContract,
     RateModel,
@@ -452,6 +513,21 @@ impl LendingContract {
                 total_rewards_distributed: 0,
             },
         );
+
+        // Initialize insurance fund
+        env.storage().instance().set(
+            &DataKey::InsuranceFund,
+            &InsuranceFund {
+                total_premiums_collected: 0,
+                total_claims_paid: 0,
+                available_balance: 0,
+            },
+        );
+
+        // Initialize insurance premium rate
+        env.storage()
+            .instance()
+            .set(&DataKey::InsurancePremiumRate, &DEFAULT_INSURANCE_PREMIUM_RATE_BPS);
 
         access_control::assign_role(&env, &admin, Role::Admin);
         Ok(())
@@ -2630,6 +2706,504 @@ impl LendingContract {
             total_interest,
             depositor_interest,
             protocol_interest
+        );
+
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────
+    // Loan Insurance Functions
+    // ─────────────────────────────────────────────────
+
+    /// Initialize insurance fund (called during contract initialization or by admin)
+    fn init_insurance_fund_if_needed(env: &Env) {
+        if !env.storage().instance().has(&DataKey::InsuranceFund) {
+            env.storage().instance().set(
+                &DataKey::InsuranceFund,
+                &InsuranceFund {
+                    total_premiums_collected: 0,
+                    total_claims_paid: 0,
+                    available_balance: 0,
+                },
+            );
+        }
+        if !env.storage().instance().has(&DataKey::InsurancePremiumRate) {
+            env.storage()
+                .instance()
+                .set(&DataKey::InsurancePremiumRate, &DEFAULT_INSURANCE_PREMIUM_RATE_BPS);
+        }
+    }
+
+    /// Get insurance premium for a given loan amount
+    pub fn get_insurance_premium(env: Env, loan_amount: u64) -> Result<u64, LendingError> {
+        Self::init_insurance_fund_if_needed(&env);
+        let premium_rate_bps: u32 = env
+            .storage()
+            .instance()
+            .get::<_, u32>(&DataKey::InsurancePremiumRate)
+            .unwrap_or(DEFAULT_INSURANCE_PREMIUM_RATE_BPS);
+
+        let premium = (loan_amount as u128)
+            .checked_mul(premium_rate_bps as u128)
+            .and_then(|v| v.checked_div(10000u128))
+            .ok_or(LendingError::InvalidAmount)? as u64;
+
+        Ok(premium)
+    }
+
+    /// Set insurance premium rate (admin only)
+    pub fn set_insurance_premium_rate(
+        env: Env,
+        admin: Address,
+        premium_rate_bps: u32,
+    ) -> Result<(), LendingError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        if premium_rate_bps > 10000 {
+            return Err(LendingError::InvalidAmount);
+        }
+
+        Self::init_insurance_fund_if_needed(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::InsurancePremiumRate, &premium_rate_bps);
+
+        log!(&env, "InsurancePremiumRateUpdated: rate_bps={}", premium_rate_bps);
+
+        Ok(())
+    }
+
+    /// Purchase insurance for a loan
+    pub fn purchase_loan_insurance(
+        env: Env,
+        borrower: Address,
+        loan_id: u64,
+    ) -> Result<u64, LendingError> {
+        borrower.require_auth();
+        Self::init_insurance_fund_if_needed(&env);
+
+        // Get loan record
+        let loan_key = DataKey::LoanById(loan_id);
+        let loan = env
+            .storage()
+            .instance()
+            .get::<_, LoanRecord>(&loan_key)
+            .ok_or(LendingError::LoanNotFound)?;
+
+        // Verify borrower matches
+        if loan.borrower != borrower {
+            return Err(LendingError::Unauthorized);
+        }
+
+        // Check if insurance already exists for this loan
+        let insurance_key = DataKey::Insurance(loan_id);
+        if env.storage().instance().has(&insurance_key) {
+            return Err(LendingError::InsuranceAlreadyPurchased);
+        }
+
+        // Calculate premium
+        let premium_rate_bps: u32 = env
+            .storage()
+            .instance()
+            .get::<_, u32>(&DataKey::InsurancePremiumRate)
+            .unwrap_or(DEFAULT_INSURANCE_PREMIUM_RATE_BPS);
+
+        let premium = (loan.principal as u128)
+            .checked_mul(premium_rate_bps as u128)
+            .and_then(|v| v.checked_div(10000u128))
+            .ok_or(LendingError::InvalidAmount)? as u64;
+
+        if premium == 0 {
+            return Err(LendingError::InvalidInsuranceAmount);
+        }
+
+        // Transfer premium from borrower to insurance fund (using underlying token)
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_client = token::Client::new(&env, &token);
+
+        token_client.transfer(&borrower, &env.current_contract_address(), &(premium as i128));
+
+        // Coverage is 100% of principal
+        let coverage_amount = loan.principal;
+
+        // Create insurance record
+        let insurance = LoanInsurance {
+            loan_id,
+            borrower: borrower.clone(),
+            coverage_amount,
+            premium_paid: premium,
+            premium_rate_bps,
+            purchase_time: env.ledger().timestamp(),
+            expires_at: loan.due_date,
+            claimed: false,
+        };
+
+        env.storage().instance().set(&insurance_key, &insurance);
+
+        // Update insurance fund
+        let mut fund: InsuranceFund = env
+            .storage()
+            .instance()
+            .get(&DataKey::InsuranceFund)
+            .unwrap_or(InsuranceFund {
+                total_premiums_collected: 0,
+                total_claims_paid: 0,
+                available_balance: 0,
+            });
+
+        fund.total_premiums_collected = fund.total_premiums_collected.saturating_add(premium);
+        fund.available_balance = fund.available_balance.saturating_add(premium);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::InsuranceFund, &fund);
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("INS"), symbol_short!("BOUGHT")),
+            InsurancePurchasedEvent {
+                loan_id,
+                borrower: borrower.clone(),
+                coverage_amount,
+                premium_paid: premium,
+                premium_rate_bps,
+                expires_at: loan.due_date,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        log!(
+            &env,
+            "InsurancePurchased: loan_id={}, borrower={}, premium={}, coverage={}",
+            loan_id,
+            borrower,
+            premium,
+            coverage_amount
+        );
+
+        Ok(premium)
+    }
+
+    /// Check if a loan has active insurance
+    pub fn is_loan_insured(env: Env, loan_id: u64) -> Result<bool, LendingError> {
+        let insurance_key = DataKey::Insurance(loan_id);
+        let insurance: Option<LoanInsurance> = env.storage().instance().get(&insurance_key);
+
+        if let Some(ins) = insurance {
+            // Check if not expired and not already claimed
+            let current_time = env.ledger().timestamp();
+            Ok(!ins.claimed && current_time < ins.expires_at)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Get insurance coverage amount for a loan
+    pub fn get_insurance_coverage(env: Env, loan_id: u64) -> Result<u64, LendingError> {
+        let insurance_key = DataKey::Insurance(loan_id);
+        let insurance: Option<LoanInsurance> = env.storage().instance().get(&insurance_key);
+
+        if let Some(ins) = insurance {
+            if !ins.claimed && env.ledger().timestamp() < ins.expires_at {
+                return Ok(ins.coverage_amount);
+            }
+        }
+
+        Ok(0)
+    }
+
+    /// Get insurance details for a loan
+    pub fn get_insurance_details(env: Env, loan_id: u64) -> Result<Option<LoanInsurance>, LendingError> {
+        let insurance_key = DataKey::Insurance(loan_id);
+        Ok(env.storage().instance().get(&insurance_key))
+    }
+
+    /// Claim insurance when loan defaults
+    pub fn claim_insurance(env: Env, loan_id: u64) -> Result<u64, LendingError> {
+        let insurance_key = DataKey::Insurance(loan_id);
+        let mut insurance: LoanInsurance = env
+            .storage()
+            .instance()
+            .get(&insurance_key)
+            .ok_or(LendingError::InsuranceNotFound)?;
+
+        // Check if insurance is still valid
+        if insurance.claimed {
+            return Err(LendingError::InsuranceAlreadyClaimed);
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time >= insurance.expires_at {
+            return Err(LendingError::InsuranceExpired);
+        }
+
+        // Get loan to verify it exists and is in default
+        let loan_key = DataKey::LoanById(loan_id);
+        let loan = env
+            .storage()
+            .instance()
+            .get::<_, LoanRecord>(&loan_key)
+            .ok_or(LendingError::LoanNotFound)?;
+
+        // Verify loan is past due
+        if current_time <= loan.due_date {
+            return Err(LendingError::InvalidAmount);
+        }
+
+        // Get insurance fund and verify sufficient balance
+        let mut fund: InsuranceFund = env
+            .storage()
+            .instance()
+            .get(&DataKey::InsuranceFund)
+            .ok_or(LendingError::InsuranceNotFound)?;
+
+        let claim_amount = insurance.coverage_amount;
+
+        if fund.available_balance < claim_amount {
+            return Err(LendingError::InsufficientInsuranceFund);
+        }
+
+        // Mark as claimed
+        insurance.claimed = true;
+        env.storage().instance().set(&insurance_key, &insurance);
+
+        // Update insurance fund
+        fund.total_claims_paid = fund.total_claims_paid.saturating_add(claim_amount);
+        fund.available_balance = fund.available_balance.saturating_sub(claim_amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::InsuranceFund, &fund);
+
+        // Transfer claim amount to contract (funds holder for protocol)
+        // In a real system, this would be transferred to a claims reserve
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_client = token::Client::new(&env, &token);
+
+        // Transfer from contract to claims reserve (in this case, just update balance tracking)
+        // The actual transfer would happen when liquidation processes the claim
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("INS"), symbol_short!("CLAIM")),
+            InsuranceClaimedEvent {
+                loan_id,
+                borrower: insurance.borrower.clone(),
+                claim_amount,
+                coverage_amount: insurance.coverage_amount,
+                timestamp: current_time,
+            },
+        );
+
+        log!(
+            &env,
+            "InsuranceClaimed: loan_id={}, claim_amount={}, remaining_fund={}",
+            loan_id,
+            claim_amount,
+            fund.available_balance
+        );
+
+        Ok(claim_amount)
+    }
+
+    /// Cancel insurance and get partial refund (pro-rata based on time remaining)
+    pub fn cancel_insurance(env: Env, borrower: Address, loan_id: u64) -> Result<u64, LendingError> {
+        borrower.require_auth();
+
+        let insurance_key = DataKey::Insurance(loan_id);
+        let insurance: LoanInsurance = env
+            .storage()
+            .instance()
+            .get(&insurance_key)
+            .ok_or(LendingError::InsuranceNotFound)?;
+
+        // Verify borrower matches
+        if insurance.borrower != borrower {
+            return Err(LendingError::Unauthorized);
+        }
+
+        // Cannot cancel claimed insurance
+        if insurance.claimed {
+            return Err(LendingError::InsuranceAlreadyClaimed);
+        }
+
+        let current_time = env.ledger().timestamp();
+
+        // Calculate time-based refund: if cancelled before expiry, refund pro-rata
+        let refund_amount = if current_time < insurance.expires_at {
+            let total_duration = insurance.expires_at.saturating_sub(insurance.purchase_time);
+            let elapsed = current_time.saturating_sub(insurance.purchase_time);
+            let remaining = total_duration.saturating_sub(elapsed);
+
+            // Refund = premium * (remaining time / total time)
+            if total_duration > 0 {
+                (insurance.premium_paid as u128)
+                    .checked_mul(remaining as u128)
+                    .and_then(|v| v.checked_div(total_duration as u128))
+                    .unwrap_or(0) as u64
+            } else {
+                0
+            }
+        } else {
+            // Insurance expired, no refund
+            0
+        };
+
+        // Remove insurance record
+        env.storage().instance().remove(&insurance_key);
+
+        // Update insurance fund
+        if refund_amount > 0 {
+            let mut fund: InsuranceFund = env
+                .storage()
+                .instance()
+                .get(&DataKey::InsuranceFund)
+                .unwrap_or(InsuranceFund {
+                    total_premiums_collected: 0,
+                    total_claims_paid: 0,
+                    available_balance: 0,
+                });
+
+            fund.available_balance = fund.available_balance.saturating_sub(refund_amount);
+            env.storage()
+                .instance()
+                .set(&DataKey::InsuranceFund, &fund);
+
+            // Transfer refund to borrower
+            let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+            let token_client = token::Client::new(&env, &token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &borrower,
+                &(refund_amount as i128),
+            );
+        }
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("INS"), symbol_short!("CANC")),
+            InsuranceCancelledEvent {
+                loan_id,
+                borrower: borrower.clone(),
+                refund_amount,
+                timestamp: current_time,
+            },
+        );
+
+        log!(
+            &env,
+            "InsuranceCancelled: loan_id={}, refund_amount={}",
+            loan_id,
+            refund_amount
+        );
+
+        Ok(refund_amount)
+    }
+
+    /// Get insurance fund state
+    pub fn get_insurance_fund_state(env: Env) -> Result<InsuranceFund, LendingError> {
+        Self::init_insurance_fund_if_needed(&env);
+        Ok(env
+            .storage()
+            .instance()
+            .get(&DataKey::InsuranceFund)
+            .unwrap_or(InsuranceFund {
+                total_premiums_collected: 0,
+                total_claims_paid: 0,
+                available_balance: 0,
+            }))
+    }
+
+    /// Deposit funds to insurance fund (admin function for funding)
+    pub fn deposit_to_insurance_fund(
+        env: Env,
+        admin: Address,
+        amount: u64,
+    ) -> Result<(), LendingError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        if amount == 0 {
+            return Err(LendingError::InvalidAmount);
+        }
+
+        Self::init_insurance_fund_if_needed(&env);
+
+        // Transfer from admin to contract
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&admin, &env.current_contract_address(), &(amount as i128));
+
+        // Update insurance fund balance
+        let mut fund: InsuranceFund = env
+            .storage()
+            .instance()
+            .get(&DataKey::InsuranceFund)
+            .unwrap_or(InsuranceFund {
+                total_premiums_collected: 0,
+                total_claims_paid: 0,
+                available_balance: 0,
+            });
+
+        fund.available_balance = fund.available_balance.saturating_add(amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::InsuranceFund, &fund);
+
+        log!(
+            &env,
+            "InsuranceFundDeposited: amount={}, new_balance={}",
+            amount,
+            fund.available_balance
+        );
+
+        Ok(())
+    }
+
+    /// Withdraw from insurance fund (admin function)
+    pub fn withdraw_from_insurance_fund(
+        env: Env,
+        admin: Address,
+        amount: u64,
+    ) -> Result<(), LendingError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        if amount == 0 {
+            return Err(LendingError::InvalidAmount);
+        }
+
+        Self::init_insurance_fund_if_needed(&env);
+
+        let mut fund: InsuranceFund = env
+            .storage()
+            .instance()
+            .get(&DataKey::InsuranceFund)
+            .ok_or(LendingError::InsuranceNotFound)?;
+
+        if fund.available_balance < amount {
+            return Err(LendingError::InsufficientLiquidity);
+        }
+
+        fund.available_balance = fund.available_balance.saturating_sub(amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::InsuranceFund, &fund);
+
+        // Transfer to admin
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &admin,
+            &(amount as i128),
+        );
+
+        log!(
+            &env,
+            "InsuranceFundWithdrawn: amount={}, new_balance={}",
+            amount,
+            fund.available_balance
         );
 
         Ok(())
