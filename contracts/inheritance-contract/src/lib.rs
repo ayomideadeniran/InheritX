@@ -64,7 +64,6 @@ pub struct InheritancePlan {
     pub waterfall_enabled: bool,
 }
 
-#[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InheritanceError {
     InvalidAssetType = 1,
@@ -117,6 +116,13 @@ pub enum InheritanceError {
     WillVersionNotFound = 48,
     WillAlreadyFinalized = 49,
     WillNotVerified = 50,
+    VestingScheduleNotFound = 51,
+    VestingScheduleExists = 52,
+    VestingAlreadyStarted = 53,
+    VestingScheduleActive = 54,
+    InvalidVestingParams = 55,
+    NothingToClaim = 56,
+    VestingExitSettlementPending = 57,
 }
 
 #[contracttype]
@@ -1915,6 +1921,10 @@ impl InheritanceContract {
 
         let index = beneficiary_index.ok_or(InheritanceError::BeneficiaryNotFound)?;
 
+        if Self::has_active_vesting_schedule(&env, plan_id, index) {
+            return Err(InheritanceError::VestingScheduleActive);
+        }
+
         // Waterfall ordering: if enabled, every strictly higher-priority
         // beneficiary (non-zero priority) must have claimed first.
         if plan.waterfall_enabled {
@@ -1927,17 +1937,13 @@ impl InheritanceContract {
             }
         }
 
-        // Record the claim
-        let claim = ClaimRecord {
-            plan_id,
-            beneficiary_index: index,
-            claimed_at: env.ledger().timestamp(),
-        };
-
-        env.storage().persistent().set(&claim_key, &claim);
-
         // --- Payout Logic ---
-        let payout = Self::calculate_waterfall_payout(&env, &plan, index);
+        let mut payout = Self::calculate_waterfall_payout(&env, &plan, index);
+
+        let exit_settlement = Self::get_vesting_exit_settlement(&env, plan_id, index);
+        if exit_settlement > 0 {
+            payout = payout.min(exit_settlement);
+        }
 
         // Emergency Guard: Limit claim if emergency access was recently activated
         if Self::is_emergency_active(&env, plan_id) {
@@ -1968,24 +1974,49 @@ impl InheritanceContract {
             return Err(InheritanceError::InsufficientLiquidity);
         }
 
+        if payout == 0 {
+            return Err(InheritanceError::NothingToClaim);
+        }
+
         // Transfer funds to beneficiary
         // Note: For fiat (bank_account), this would typically emit an event for off-chain processing.
         // Here, we'll try to transfer USDC if an address can be derived, or just emit an event.
         // As a simplification, we'll emit the event first.
 
-        // Update plan balances and mark beneficiary as claimed
+        // Update plan balances and mark beneficiary as claimed when fully finalized
         let mut updated_plan = plan.clone();
+
+        let exit_remaining_after = exit_settlement.saturating_sub(payout);
+        let exit_finalized = exit_settlement == 0 || exit_remaining_after == 0;
 
         // Update the specific beneficiary in the vector
         let mut b = updated_plan.beneficiaries.get(index).unwrap();
-        b.is_claimed = true;
+        if exit_finalized {
+            b.is_claimed = true;
+        }
         updated_plan.beneficiaries.set(index, b);
 
         updated_plan.total_amount = updated_plan.total_amount.saturating_sub(payout);
         Self::store_plan(&env, plan_id, &updated_plan);
 
-        // Mark plan as claimed
-        Self::add_plan_to_claimed(&env, plan.owner.clone(), plan_id);
+        if exit_settlement > 0 {
+            let settle_key = DataKey::VestingExitSettlement(plan_id, index);
+            if exit_remaining_after == 0 {
+                env.storage().persistent().remove(&settle_key);
+            } else {
+                env.storage().persistent().set(&settle_key, &exit_remaining_after);
+            }
+        }
+
+        if exit_finalized {
+            let claim = ClaimRecord {
+                plan_id,
+                beneficiary_index: index,
+                claimed_at: env.ledger().timestamp(),
+            };
+            env.storage().persistent().set(&claim_key, &claim);
+            Self::add_plan_to_claimed(&env, plan.owner.clone(), plan_id);
+        }
 
         // Grant Beneficiary role to the claimer as an on-chain record of a successful claim
         access_control::assign_role(&env, &claimer, Role::Beneficiary);
