@@ -16,6 +16,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
+use jsonwebtoken::{decode, Validation};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -82,10 +83,15 @@ fn extract_bearer(req: &Request<Body>) -> Option<String> {
 }
 
 fn decode_claims(token: &str, secret: &str) -> Option<UserClaims> {
-    jsonwebtoken::decode::<UserClaims>(
+    let mut validation = Validation::default();
+    // Ensure expiration is always validated
+    validation.validate_exp = true;
+    validation.required_spec_claims.insert("exp".to_string());
+    
+    decode::<UserClaims>(
         token,
         &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
-        &jsonwebtoken::Validation::default(),
+        &validation,
     )
     .map(|d| d.claims)
     .ok()
@@ -266,13 +272,13 @@ pub async fn revoke_session(
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 
-/// Rejects requests whose JWT has been explicitly revoked.
+/// Rejects requests whose JWT has been explicitly revoked OR expired.
 ///
 /// This middleware runs after the JWT signature check so it only queries the
 /// database for structurally valid tokens. Requests without an `Authorization`
 /// header are passed through (open endpoints handle their own auth).
 pub async fn session_guard_middleware(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>, 
     req: Request<Body>,
     next: Next,
 ) -> Response {
@@ -283,24 +289,35 @@ pub async fn session_guard_middleware(
 
     let token_hash = hash_token(&raw_token);
 
-    let revoked = sqlx::query_scalar::<_, bool>(
+    let result = sqlx::query_as::<_, (bool, Option<DateTime<Utc>>)> (
         r#"
-        SELECT EXISTS (
-            SELECT 1 FROM sessions
-            WHERE token_hash = $1 AND revoked = TRUE
-        )
+        SELECT revoked, expires_at FROM sessions
+        WHERE token_hash = $1
         "#,
     )
     .bind(&token_hash)
-    .fetch_one(&state.db)
+    .fetch_optional(&state.db)
     .await;
 
-    match revoked {
-        Ok(true) => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Session has been revoked. Please log in again." })),
-        )
-            .into_response(),
-        Ok(false) | Err(_) => next.run(req).await,
+    match result {
+        Ok(Some((revoked, expires_at))) => {
+            let now = Utc::now();
+            if revoked || expires_at.map(|e| e < now).unwrap_or(true) {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "Session is invalid. Please log in again." })),
+                )
+                    .into_response();
+            }
+        }
+        Ok(None) => {
+            // Session not found - could be a new token or invalid token
+            // Let the auth extractor handle this case
+        }
+        Err(_) => {
+            // Database error - let the request proceed and let auth extractor handle
+        }
     }
+
+    next.run(req).await
 }
