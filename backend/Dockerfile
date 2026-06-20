@@ -21,6 +21,7 @@ RUN mkdir src && \
 # Copy source code
 COPY backend/src ./src
 COPY backend/config ./config
+COPY backend/migrations ./migrations
 
 # Build the application
 RUN cargo build --release
